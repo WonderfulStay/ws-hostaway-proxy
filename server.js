@@ -1,77 +1,130 @@
-const express = require('express');
-const cors = require('cors');
-const fetch = require('node-fetch');
-const app = express();
+const http = require('http');
+const https = require('https');
+const url = require('url');
 
-// CORS — sta alle origins toe (vereist voor browser-aanroepen)
-app.use(cors({
-  origin: '*',
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'Accept'],
-  preflightContinue: false,
-  optionsSuccessStatus: 200
-}));
-app.options('*', cors());
-app.use(express.json());
+const PORT = process.env.PORT || 3000;
+const ACCOUNT_ID = '108363';
+const SECRET = '7e00ad68fdc06e5d80d743b3a9dbd48112f189e56fabdda911186eef8ee9c8fc';
 
-// Keep-alive
-const SELF_URL = process.env.RENDER_EXTERNAL_URL || "https://ws-hostaway-proxy.onrender.com";
-setInterval(async () => {
-  try {
-    await fetch(`${SELF_URL}/ping`);
-    console.log(`[keep-alive] ${new Date().toISOString()}`);
-  } catch(e) {
-    console.log(`[keep-alive] failed: ${e.message}`);
-  }
-}, 14 * 60 * 1000);
+function addCORS(res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,Accept,X-Requested-With');
+  res.setHeader('Access-Control-Max-Age', '86400');
+}
 
-app.get('/ping', (req, res) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.json({ status: "awake", time: new Date().toISOString() });
-});
+function proxyRequest(targetUrl, options, body, res) {
+  const parsed = url.parse(targetUrl);
+  const reqOptions = {
+    hostname: parsed.hostname,
+    port: 443,
+    path: parsed.path,
+    method: options.method || 'GET',
+    headers: options.headers || {}
+  };
 
-// Token
-app.post('/token', async (req, res) => {
-  try {
-    const r = await fetch('https://api.hostaway.com/v1/accessTokens', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: 'grant_type=client_credentials&client_id=108363&client_secret=7e00ad68fdc06e5d80d743b3a9dbd48112f189e56fabdda911186eef8ee9c8fc&scope=general'
+  const req = https.request(reqOptions, (proxyRes) => {
+    let data = '';
+    proxyRes.on('data', chunk => data += chunk);
+    proxyRes.on('end', () => {
+      addCORS(res);
+      res.setHeader('Content-Type', 'application/json');
+      res.writeHead(proxyRes.statusCode);
+      res.end(data);
     });
-    const data = await r.json();
-    console.log('[token] response status:', r.status, '| has token:', !!data.access_token);
-    res.json(data);
-  } catch(e) {
-    console.error('[token] error:', e.message);
-    res.status(500).json({ error: e.message });
-  }
-});
+  });
 
-// Hostaway API proxy
-app.all('/api/*', async (req, res) => {
-  try {
-    const path  = req.path.replace('/api/', '');
-    const query = req.url.includes('?') ? req.url.substring(req.url.indexOf('?')) : '';
-    const url   = `https://api.hostaway.com/v1/${path}${query}`;
-    console.log(`[api] ${req.method} ${url}`);
-    const r = await fetch(url, {
-      method: req.method,
+  req.on('error', (e) => {
+    addCORS(res);
+    res.writeHead(500);
+    res.end(JSON.stringify({ error: e.message }));
+  });
+
+  if (body) req.write(body);
+  req.end();
+}
+
+const server = http.createServer((req, res) => {
+  const parsed = url.parse(req.url, true);
+  const path = parsed.pathname;
+
+  // Handle preflight
+  if (req.method === 'OPTIONS') {
+    addCORS(res);
+    res.writeHead(200);
+    res.end();
+    return;
+  }
+
+  // Ping
+  if (path === '/ping') {
+    addCORS(res);
+    res.setHeader('Content-Type', 'application/json');
+    res.writeHead(200);
+    res.end(JSON.stringify({ status: 'awake', time: new Date().toISOString() }));
+    return;
+  }
+
+  // Root
+  if (path === '/') {
+    addCORS(res);
+    res.setHeader('Content-Type', 'application/json');
+    res.writeHead(200);
+    res.end(JSON.stringify({ status: 'Wonderful Stay Proxy v3', cors: 'enabled' }));
+    return;
+  }
+
+  // Token
+  if (path === '/token' && req.method === 'POST') {
+    const body = `grant_type=client_credentials&client_id=${ACCOUNT_ID}&client_secret=${SECRET}&scope=general`;
+    proxyRequest('https://api.hostaway.com/v1/accessTokens', {
+      method: 'POST',
       headers: {
-        'Authorization': req.headers.authorization || '',
-        'Content-Type': 'application/json',
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(body),
         'Accept': 'application/json'
       }
-    });
-    const data = await r.json();
-    res.json(data);
-  } catch(e) {
-    console.error('[api] error:', e.message);
-    res.status(500).json({ error: e.message });
+    }, body, res);
+    return;
   }
+
+  // API proxy
+  if (path.startsWith('/api/')) {
+    const hostawayPath = path.replace('/api/', '');
+    const queryString = parsed.search || '';
+    const targetUrl = `https://api.hostaway.com/v1/${hostawayPath}${queryString}`;
+    const auth = req.headers['authorization'] || '';
+
+    let body = '';
+    req.on('data', chunk => body += chunk);
+    req.on('end', () => {
+      proxyRequest(targetUrl, {
+        method: req.method,
+        headers: {
+          'Authorization': auth,
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+          ...(body ? { 'Content-Length': Buffer.byteLength(body) } : {})
+        }
+      }, body || null, res);
+    });
+    return;
+  }
+
+  // 404
+  addCORS(res);
+  res.writeHead(404);
+  res.end(JSON.stringify({ error: 'Not found' }));
 });
 
-app.get('/', (req, res) => res.json({ status: 'Wonderful Stay Proxy', version: '2.0' }));
+// Keep-alive
+const SELF = process.env.RENDER_EXTERNAL_URL || 'https://ws-hostaway-proxy.onrender.com';
+setInterval(() => {
+  https.get(`${SELF}/ping`, (r) => {
+    console.log(`[keep-alive] ${new Date().toISOString()} status:${r.statusCode}`);
+  }).on('error', e => console.log(`[keep-alive] error: ${e.message}`));
+}, 14 * 60 * 1000);
 
-app.listen(process.env.PORT || 3000, () => {
-  console.log('Proxy v2 running — CORS enabled for all origins');
+server.listen(PORT, () => {
+  console.log(`Proxy v3 running on port ${PORT} — zero dependencies CORS`);
 });
