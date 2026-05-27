@@ -4,7 +4,7 @@ const url = require('url');
 
 const PORT = process.env.PORT || 3000;
 const ACCOUNT_ID = '108363';
-const SECRET = '7e00ad68fdc06e5d80d743b3a9dbd48112f189e56fabdda911186eef8ee9c8fc';
+const SECRET = 'cc3b40ffdec6f95314d709a7908d046faff5f08ba9234910a6d56def0c9b1e87';
 
 function addCORS(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
